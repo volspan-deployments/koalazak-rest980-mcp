@@ -69,6 +69,7 @@ async def get_roomba_status(api_type: str = "local") -> dict:
     cleaning phase, position, mission info, and connectivity. Use this to check if
     the robot is cleaning, docking, idle, or in an error state before issuing commands.
     """
+    _track("get_roomba_status")
     try:
         # Get mission/state info
         mission_path = f"/api/{api_type}/info/mission"
@@ -112,6 +113,7 @@ async def start_cleaning(api_type: str = "local") -> dict:
     Start a cleaning mission on the Roomba. Use this when the user wants the robot
     to begin vacuuming. The robot must be docked or idle for this to work.
     """
+    _track("start_cleaning")
     try:
         path = f"/api/{api_type}/action/start"
         result = await make_request("GET", path)
@@ -130,6 +132,7 @@ async def stop_cleaning(api_type: str = "local") -> dict:
     Stop the current cleaning mission and pause the Roomba in place. Use this when
     the user wants to halt cleaning without sending the robot back to the dock.
     """
+    _track("stop_cleaning")
     try:
         path = f"/api/{api_type}/action/stop"
         result = await make_request("GET", path)
@@ -148,6 +151,7 @@ async def dock_roomba(api_type: str = "local") -> dict:
     Send the Roomba back to its Home Base dock to charge. Use this after cleaning
     is complete or when the user wants to end a session and have the robot return home.
     """
+    _track("dock_roomba")
     try:
         path = f"/api/{api_type}/action/dock"
         result = await make_request("GET", path)
@@ -166,6 +170,7 @@ async def pause_cleaning(api_type: str = "local") -> dict:
     Pause the Roomba mid-mission without ending the cleaning session. The robot will
     stop in place and the mission can be resumed later. Use this for a temporary halt.
     """
+    _track("pause_cleaning")
     try:
         path = f"/api/{api_type}/action/pause"
         result = await make_request("GET", path)
@@ -184,6 +189,7 @@ async def resume_cleaning(api_type: str = "local") -> dict:
     Resume a previously paused cleaning mission. Use this to continue cleaning after
     the Roomba has been paused, without starting an entirely new mission.
     """
+    _track("resume_cleaning")
     try:
         path = f"/api/{api_type}/action/resume"
         result = await make_request("GET", path)
@@ -203,6 +209,7 @@ async def get_cleaning_map(mode: str = "latest", format: str = "png") -> dict:
     data. Use this to show the user a visual map of what areas have been cleaned during
     the current or last mission.
     """
+    _track("get_cleaning_map")
     try:
         # rest980 serves maps at /map endpoint
         if mode == "latest":
@@ -243,6 +250,7 @@ async def get_cleaning_map(mode: str = "latest", format: str = "png") -> dict:
 
 @mcp.tool()
 async def send_roomba_command(
+    _track("send_roomba_command")
     command: str,
     params: Optional[List[Any]] = None,
     api_type: str = "local"

@@ -6,8 +6,8 @@ import threading
 from fastmcp import FastMCP
 import httpx
 import os
-import json
-from typing import Optional, List
+import base64
+from typing import Optional, List, Any
 
 mcp = FastMCP("rest980")
 
@@ -16,213 +16,312 @@ BASIC_AUTH_USER = os.environ.get("BASIC_AUTH_USER", "")
 BASIC_AUTH_PASS = os.environ.get("BASIC_AUTH_PASS", "")
 
 
-def get_auth():
+def get_auth_headers() -> dict:
+    """Build basic auth headers if credentials are configured."""
     if BASIC_AUTH_USER and BASIC_AUTH_PASS:
-        return (BASIC_AUTH_USER, BASIC_AUTH_PASS)
-    return None
+        credentials = base64.b64encode(
+            f"{BASIC_AUTH_USER}:{BASIC_AUTH_PASS}".encode()
+        ).decode()
+        return {"Authorization": f"Basic {credentials}"}
+    return {}
 
 
-async def make_request(method: str, path: str, json_body=None, params=None):
-    auth = get_auth()
+async def make_request(
+    method: str,
+    path: str,
+    params: Optional[dict] = None,
+    json_body: Optional[dict] = None,
+) -> dict:
+    """Make an HTTP request to the rest980 server."""
     url = f"{BASE_URL}{path}"
+    headers = get_auth_headers()
     async with httpx.AsyncClient(timeout=30.0) as client:
-        kwargs = {"url": url}
-        if auth:
-            kwargs["auth"] = auth
-        if params:
-            kwargs["params"] = params
-        if json_body is not None:
-            kwargs["json"] = json_body
-        response = await getattr(client, method.lower())(**kwargs)
+        if method.upper() == "GET":
+            response = await client.get(url, headers=headers, params=params)
+        elif method.upper() == "POST":
+            response = await client.post(url, headers=headers, json=json_body, params=params)
+        else:
+            response = await client.request(method, url, headers=headers, params=params, json=json_body)
+        
         response.raise_for_status()
-        try:
+        
+        content_type = response.headers.get("content-type", "")
+        if "application/json" in content_type:
             return response.json()
-        except Exception:
-            return {"raw": response.text, "status_code": response.status_code}
+        elif "image/" in content_type or "png" in content_type:
+            return {
+                "content_type": content_type,
+                "data_base64": base64.b64encode(response.content).decode(),
+                "size_bytes": len(response.content),
+                "message": "Map image retrieved successfully. Data is base64 encoded."
+            }
+        else:
+            try:
+                return response.json()
+            except Exception:
+                return {"response": response.text, "status_code": response.status_code}
 
 
 @mcp.tool()
 async def get_roomba_status(api_type: str = "local") -> dict:
     """
     Get the current status and state of the Roomba robot, including battery level,
-    cleaning state, mission status, and position. Use this to check if the robot
-    is cleaning, docked, or idle before issuing commands.
+    cleaning phase, position, mission info, and connectivity. Use this to check if
+    the robot is cleaning, docking, idle, or in an error state before issuing commands.
     """
-    path = f"/api/{api_type}/info/state"
     try:
-        result = await make_request("GET", path)
-        return {"success": True, "api_type": api_type, "status": result}
-    except httpx.HTTPStatusError as e:
-        # Try mission endpoint as fallback
+        # Get mission/state info
+        mission_path = f"/api/{api_type}/info/mission"
+        mission_data = await make_request("GET", mission_path)
+
+        # Also try to get general state
         try:
-            mission_path = f"/api/{api_type}/info/mission"
-            mission_result = await make_request("GET", mission_path)
-            return {"success": True, "api_type": api_type, "status": mission_result}
-        except Exception as e2:
-            return {"success": False, "error": str(e), "fallback_error": str(e2)}
+            state_path = f"/api/{api_type}/info/state"
+            state_data = await make_request("GET", state_path)
+        except Exception:
+            state_data = None
+
+        # Try battery info
+        try:
+            battery_path = f"/api/{api_type}/info/batInfo"
+            battery_data = await make_request("GET", battery_path)
+        except Exception:
+            battery_data = None
+
+        result = {
+            "mission": mission_data,
+            "api_type": api_type,
+        }
+        if state_data:
+            result["state"] = state_data
+        if battery_data:
+            result["battery_info"] = battery_data
+
+        return result
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP error {e.response.status_code}: {e.response.text}", "api_type": api_type}
+    except httpx.ConnectError:
+        return {"error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?", "api_type": api_type}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"error": str(e), "api_type": api_type}
 
 
 @mcp.tool()
-async def start_cleaning(
-    api_type: str = "local",
-    pmap_id: Optional[str] = None,
-    regions: Optional[List[dict]] = None
-) -> dict:
+async def start_cleaning(api_type: str = "local") -> dict:
     """
-    Start a cleaning mission on the Roomba. Use this to begin vacuuming.
-    Can optionally specify a room or zone for i7/i7+ models that support smart mapping.
+    Start a cleaning mission on the Roomba. Use this when the user wants the robot
+    to begin vacuuming. The robot must be docked or idle for this to work.
     """
     try:
-        if pmap_id and regions:
-            # Use cleanRoom endpoint for targeted cleaning (POST)
-            path = f"/api/{api_type}/action/cleanRoom"
-            body = {"pmap_id": pmap_id, "regions": regions}
-            result = await make_request("POST", path, json_body=body)
-        else:
-            # Use standard start endpoint (GET)
-            path = f"/api/{api_type}/action/start"
-            result = await make_request("GET", path)
-        return {"success": True, "api_type": api_type, "result": result}
+        path = f"/api/{api_type}/action/start"
+        result = await make_request("GET", path)
+        return {"success": True, "response": result, "action": "start", "api_type": api_type}
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP error {e.response.status_code}: {e.response.text}", "action": "start", "api_type": api_type}
+    except httpx.ConnectError:
+        return {"error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?", "action": "start"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"error": str(e), "action": "start", "api_type": api_type}
 
 
 @mcp.tool()
 async def stop_cleaning(api_type: str = "local") -> dict:
     """
-    Stop the current cleaning mission and have the Roomba return to its dock/home base.
-    Use this to end an active cleaning session.
+    Stop the current cleaning mission and pause the Roomba in place. Use this when
+    the user wants to halt cleaning without sending the robot back to the dock.
     """
     try:
-        # First stop, then dock
-        stop_path = f"/api/{api_type}/action/stop"
-        stop_result = await make_request("GET", stop_path)
-        dock_path = f"/api/{api_type}/action/dock"
-        dock_result = await make_request("GET", dock_path)
+        path = f"/api/{api_type}/action/stop"
+        result = await make_request("GET", path)
+        return {"success": True, "response": result, "action": "stop", "api_type": api_type}
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP error {e.response.status_code}: {e.response.text}", "action": "stop", "api_type": api_type}
+    except httpx.ConnectError:
+        return {"error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?", "action": "stop"}
+    except Exception as e:
+        return {"error": str(e), "action": "stop", "api_type": api_type}
+
+
+@mcp.tool()
+async def dock_roomba(api_type: str = "local") -> dict:
+    """
+    Send the Roomba back to its Home Base dock to charge. Use this after cleaning
+    is complete or when the user wants to end a session and have the robot return home.
+    """
+    try:
+        path = f"/api/{api_type}/action/dock"
+        result = await make_request("GET", path)
+        return {"success": True, "response": result, "action": "dock", "api_type": api_type}
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP error {e.response.status_code}: {e.response.text}", "action": "dock", "api_type": api_type}
+    except httpx.ConnectError:
+        return {"error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?", "action": "dock"}
+    except Exception as e:
+        return {"error": str(e), "action": "dock", "api_type": api_type}
+
+
+@mcp.tool()
+async def pause_cleaning(api_type: str = "local") -> dict:
+    """
+    Pause the Roomba mid-mission without ending the cleaning session. The robot will
+    stop in place and the mission can be resumed later. Use this for a temporary halt.
+    """
+    try:
+        path = f"/api/{api_type}/action/pause"
+        result = await make_request("GET", path)
+        return {"success": True, "response": result, "action": "pause", "api_type": api_type}
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP error {e.response.status_code}: {e.response.text}", "action": "pause", "api_type": api_type}
+    except httpx.ConnectError:
+        return {"error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?", "action": "pause"}
+    except Exception as e:
+        return {"error": str(e), "action": "pause", "api_type": api_type}
+
+
+@mcp.tool()
+async def resume_cleaning(api_type: str = "local") -> dict:
+    """
+    Resume a previously paused cleaning mission. Use this to continue cleaning after
+    the Roomba has been paused, without starting an entirely new mission.
+    """
+    try:
+        path = f"/api/{api_type}/action/resume"
+        result = await make_request("GET", path)
+        return {"success": True, "response": result, "action": "resume", "api_type": api_type}
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP error {e.response.status_code}: {e.response.text}", "action": "resume", "api_type": api_type}
+    except httpx.ConnectError:
+        return {"error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?", "action": "resume"}
+    except Exception as e:
+        return {"error": str(e), "action": "resume", "api_type": api_type}
+
+
+@mcp.tool()
+async def get_cleaning_map(mode: str = "latest", format: str = "png") -> dict:
+    """
+    Retrieve the latest cleaning map image generated from the Roomba's VSLAM navigation
+    data. Use this to show the user a visual map of what areas have been cleaned during
+    the current or last mission.
+    """
+    try:
+        # rest980 serves maps at /map endpoint
+        if mode == "latest":
+            path = "/map"
+        else:
+            path = f"/map/{mode}"
+
+        url = f"{BASE_URL}{path}"
+        headers = get_auth_headers()
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "")
+            if "image" in content_type or len(response.content) > 100:
+                return {
+                    "success": True,
+                    "content_type": content_type,
+                    "data_base64": base64.b64encode(response.content).decode(),
+                    "size_bytes": len(response.content),
+                    "mode": mode,
+                    "format": format,
+                    "message": "Map image retrieved. The 'data_base64' field contains the base64-encoded image."
+                }
+            else:
+                try:
+                    return {"success": True, "response": response.json(), "mode": mode}
+                except Exception:
+                    return {"success": True, "response": response.text, "mode": mode}
+    except httpx.HTTPStatusError as e:
+        return {"error": f"HTTP error {e.response.status_code}: {e.response.text}", "mode": mode}
+    except httpx.ConnectError:
+        return {"error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?", "mode": mode}
+    except Exception as e:
+        return {"error": str(e), "mode": mode}
+
+
+@mcp.tool()
+async def send_roomba_command(
+    command: str,
+    params: Optional[List[Any]] = None,
+    api_type: str = "local"
+) -> dict:
+    """
+    Send a raw or advanced command to the Roomba that is not covered by the standard
+    start/stop/dock tools, such as setting preferences, configuring cleaning passes,
+    adjusting edge-clean settings, or invoking any dorita980 method directly.
+    Use this for advanced control or configuration tasks.
+
+    Common commands:
+    - 'find': Make the robot play a sound to locate it
+    - 'evac': Empty the bin (i7+ only)
+    - 'setCarpetBoost': Set carpet boost mode
+    - 'setEdgeClean': Enable/disable edge cleaning
+    - 'setCleaningPasses': Set number of cleaning passes
+    - 'getCarpetBoost': Get current carpet boost setting
+    - 'getCleaningPasses': Get current cleaning passes setting
+    - 'getEdgeClean': Get edge clean setting
+    - 'getPreferences': Get all preferences
+    """
+    try:
+        # Determine if this is a GET (info/query) or POST (action/set) command
+        # Commands starting with 'get' or 'info' are typically GET requests
+        command_lower = command.lower()
+        
+        # Map commands to appropriate REST endpoints
+        # Try action endpoint first for most commands
+        if command_lower.startswith("get") or command_lower in ["find"]:
+            # For find and get-type commands, use GET
+            # Try info path for get commands
+            if command_lower.startswith("get"):
+                path = f"/api/{api_type}/info/{command}"
+            else:
+                path = f"/api/{api_type}/action/{command}"
+            
+            result = await make_request("GET", path)
+        elif params is not None:
+            # POST with params for set-type commands
+            path = f"/api/{api_type}/action/{command}"
+            body = {"params": params} if params else {}
+            try:
+                result = await make_request("POST", path, json_body=body)
+            except httpx.HTTPStatusError:
+                # Fallback to GET
+                result = await make_request("GET", path)
+        else:
+            # Default to GET action
+            path = f"/api/{api_type}/action/{command}"
+            try:
+                result = await make_request("GET", path)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    # Try info path
+                    path = f"/api/{api_type}/info/{command}"
+                    result = await make_request("GET", path)
+                else:
+                    raise
+
         return {
             "success": True,
+            "command": command,
+            "params": params,
             "api_type": api_type,
-            "stop_result": stop_result,
-            "dock_result": dock_result
+            "response": result
+        }
+    except httpx.HTTPStatusError as e:
+        return {
+            "error": f"HTTP error {e.response.status_code}: {e.response.text}",
+            "command": command,
+            "api_type": api_type
+        }
+    except httpx.ConnectError:
+        return {
+            "error": f"Could not connect to rest980 at {BASE_URL}. Is the server running?",
+            "command": command
         }
     except Exception as e:
-        # Try dock only if stop failed
-        try:
-            dock_path = f"/api/{api_type}/action/dock"
-            dock_result = await make_request("GET", dock_path)
-            return {"success": True, "api_type": api_type, "dock_result": dock_result, "note": "stop failed, sent dock command"}
-        except Exception as e2:
-            return {"success": False, "error": str(e), "dock_error": str(e2)}
-
-
-@mcp.tool()
-async def pause_resume_cleaning(action: str, api_type: str = "local") -> dict:
-    """
-    Pause an active cleaning mission or resume a paused one.
-    Use pause when you need to temporarily halt cleaning without ending the mission,
-    and resume to continue from where it left off.
-    """
-    if action not in ("pause", "resume"):
-        return {"success": False, "error": f"Invalid action '{action}'. Must be 'pause' or 'resume'."}
-    try:
-        path = f"/api/{api_type}/action/{action}"
-        result = await make_request("GET", path)
-        return {"success": True, "api_type": api_type, "action": action, "result": result}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def get_robot_info(
-    info_type: str = "sys",
-    api_type: str = "local"
-) -> dict:
-    """
-    Retrieve detailed information about the Roomba robot including firmware version,
-    model, SKU, capabilities, preferences, and schedule settings.
-    info_type options: 'sys' for system info, 'prefs' for preferences,
-    'schedule' for cleaning schedule, 'cloud' for cloud connection info, 'week' for weekly schedule.
-    """
-    # Map info_type to actual API path segments
-    info_type_map = {
-        "sys": "sys",
-        "prefs": "prefs",
-        "schedule": "schedule",
-        "cloud": "cloud",
-        "week": "week",
-        "mission": "mission",
-        "state": "state",
-        "version": "version"
-    }
-    endpoint = info_type_map.get(info_type, info_type)
-    path = f"/api/{api_type}/info/{endpoint}"
-    try:
-        result = await make_request("GET", path)
-        return {"success": True, "api_type": api_type, "info_type": info_type, "data": result}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def set_robot_preferences(
-    preferences: str,
-    api_type: str = "local"
-) -> dict:
-    """
-    Update Roomba preferences and settings such as cleaning passes, carpet boost,
-    edge clean, and scheduled cleaning times. preferences should be a JSON string
-    of key-value pairs. Examples: noAutoPasses, twoPass, carpetBoost, openOnly, schedHold, binPause.
-    """
-    try:
-        prefs_dict = json.loads(preferences)
-    except json.JSONDecodeError as e:
-        return {"success": False, "error": f"Invalid JSON in preferences: {str(e)}"}
-
-    try:
-        path = f"/api/{api_type}/action/setPrefs"
-        result = await make_request("POST", path, json_body=prefs_dict)
-        return {"success": True, "api_type": api_type, "updated_preferences": prefs_dict, "result": result}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def get_maps(map_action: str = "list") -> dict:
-    """
-    Retrieve the floor plan maps generated by the Roomba during cleaning missions.
-    Use this for i7/i7+ models with smart mapping to get map IDs needed for
-    room-specific cleaning, or to view the latest cleaning map/path visualization.
-    map_action: 'list' to get all saved maps with their IDs and regions,
-    'latest' to get the most recent cleaning mission map image.
-    """
-    try:
-        if map_action == "latest":
-            path = "/map/latest"
-            result = await make_request("GET", path)
-            return {"success": True, "map_action": map_action, "data": result}
-        else:
-            # Default: list all maps
-            path = "/api/local/info/maps"
-            result = await make_request("GET", path)
-            return {"success": True, "map_action": map_action, "data": result}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@mcp.tool()
-async def find_robot(api_type: str = "local") -> dict:
-    """
-    Make the Roomba play a sound to help locate it in the home.
-    Use this when you cannot find where the robot is physically located.
-    """
-    try:
-        path = f"/api/{api_type}/action/find"
-        result = await make_request("GET", path)
-        return {"success": True, "api_type": api_type, "result": result, "message": "Roomba should now be playing a sound to help you locate it."}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        return {"error": str(e), "command": command, "api_type": api_type}
 
 
 
